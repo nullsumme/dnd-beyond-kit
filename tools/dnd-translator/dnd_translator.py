@@ -47,6 +47,7 @@ When translating:
 - Preserve any game notation like dice rolls (e.g., 1d20+5)
 - Be aware of D&D-specific concepts like alignment, spell schools, damage types, and conditions
 - Translate complete sentences naturally, don't translate word-by-word
+- IMPORTANT: Preserve the capitalization pattern from the original text. If the original starts with uppercase, the translation should start with uppercase (sentence beginning). If the original starts with lowercase, the translation should start with lowercase unless it's a proper noun or should be capitalized according to target language grammar rules.
 """
 
 
@@ -156,7 +157,8 @@ class DnDTranslator:
         batch_text = "\n".join([f"{i+1}. {text}" for i, text in enumerate(texts)])
         
         prompt = f"""Translate the following D&D content from {source_language} to {target_language}. 
-Return ONLY the translations in the same numbered format, nothing else:
+Return ONLY the translations in the same numbered format, nothing else.
+IMPORTANT: Preserve the capitalization pattern from the original text - if the original starts with uppercase, the translation should start with uppercase. If the original starts with lowercase, the translation should start with lowercase unless it's a proper noun or should be capitalized according to {target_language} grammar rules:
 
 {batch_text}"""
         
@@ -188,6 +190,8 @@ Return ONLY the translations in the same numbered format, nothing else:
                             # Create key-value pair with lowercased key
                             key = texts[idx].lower()
                             value = match.group(2).strip()
+                            
+                            
                             translations[key] = value
                 
                 return translations
