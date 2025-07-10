@@ -80,6 +80,7 @@ python3 dnd_translator.py -i ../../translations/base.json -l Italian --api-key y
 | `--batch-size` | Number of entries per batch | 50 |
 | `--start-line` | Start line number (1-based) | 1 |
 | `--end-line` | End line number (inclusive) | All |
+| `--skip-existing` | Skip entries that are already translated | False |
 | `--model` | OpenAI model to use | gpt-4-turbo-preview |
 | `--api-key` | OpenAI API key | From environment |
 
@@ -153,6 +154,12 @@ python3 dnd_translator.py -i ../../translations/base.json -l Spanish --start-lin
 ```
 Output: `es-es-ai.json` (with lines 500-1000)
 
+### Resume translation, skipping already translated entries
+```bash
+python3 dnd_translator.py -i ../../translations/base.json -l German --skip-existing
+```
+Output: `ge-ge-ai.json` (only translates new entries, preserves existing ones)
+
 ## Tips
 
 1. **Batch Size**: Start with smaller batches (25-50) for better error recovery
@@ -160,7 +167,8 @@ Output: `es-es-ai.json` (with lines 500-1000)
 3. **API Limits**: The tool includes delays between batches to respect rate limits
 4. **Cost**: Monitor your OpenAI usage as large translation files can be expensive
 5. **Quality**: Review translations, especially for game-specific terms
-6. **Resume**: If interrupted, you can manually merge partial results
+6. **Resume**: Use `--skip-existing` to resume interrupted translations
+7. **Incremental**: Perfect for adding new content to existing translations
 
 ## Troubleshooting
 

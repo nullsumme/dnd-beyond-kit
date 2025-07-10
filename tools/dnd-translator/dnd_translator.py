@@ -89,7 +89,8 @@ Return ONLY the translations in the same numbered format, nothing else:
     
     def translate_json_file(self, input_file: Path, output_file: Path, target_language: str, 
                           batch_size: int = 50, source_language: str = "English", 
-                          language_code: str = None, start_line: int = None, end_line: int = None) -> None:
+                          language_code: str = None, start_line: int = None, end_line: int = None, 
+                          skip_existing: bool = False) -> None:
         """Translate a JSON array file in batches"""
         try:
             # Read input file
@@ -119,8 +120,41 @@ Return ONLY the translations in the same numbered format, nothing else:
             
             print(f"Loaded {len(data)} entries from {input_file}")
             
+            # Generate output filename with -ai suffix if not provided
+            if not output_file:
+                if language_code:
+                    # Use provided language code (e.g., "de-de")
+                    output_name = f"{language_code}-ai.json"
+                else:
+                    # Generate from target language (e.g., "German" -> "de-de-ai.json")
+                    lang_code = target_language[:2].lower()
+                    output_name = f"{lang_code}-{lang_code}-ai.json"
+                
+                output_file = input_file.parent / output_name
+            
+            # Load existing translations if skip_existing is enabled
+            existing_translations = {}
+            if skip_existing and output_file.exists():
+                try:
+                    with open(output_file, 'r', encoding='utf-8') as f:
+                        existing_translations = json.load(f)
+                    print(f"Loaded {len(existing_translations)} existing translations from {output_file}")
+                except Exception as e:
+                    print(f"Warning: Could not load existing translations: {e}")
+            
+            # Filter out already translated entries
+            if skip_existing and existing_translations:
+                original_count = len(data)
+                data = [entry for entry in data if entry.lower() not in existing_translations]
+                skipped_count = original_count - len(data)
+                print(f"Skipped {skipped_count} already translated entries")
+                
+                if len(data) == 0:
+                    print("All entries already translated!")
+                    return
+            
             # Process in batches
-            all_translations = {}
+            all_translations = existing_translations.copy()  # Start with existing translations
             total_batches = (len(data) + batch_size - 1) // batch_size
             
             for i in range(0, len(data), batch_size):
@@ -142,24 +176,14 @@ Return ONLY the translations in the same numbered format, nothing else:
                     print("Continuing with next batch...")
                     continue
             
-            # Generate output filename with -ai suffix
-            if not output_file:
-                if language_code:
-                    # Use provided language code (e.g., "de-de")
-                    output_name = f"{language_code}-ai.json"
-                else:
-                    # Generate from target language (e.g., "German" -> "de-de-ai.json")
-                    lang_code = target_language[:2].lower()
-                    output_name = f"{lang_code}-{lang_code}-ai.json"
-                
-                output_file = input_file.parent / output_name
-            
             # Save translations
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(all_translations, f, ensure_ascii=False, indent=2)
             
             print(f"\nTranslation complete!")
-            print(f"Translated {len(all_translations)} out of {len(data)} entries")
+            new_translations = len(all_translations) - len(existing_translations)
+            print(f"Translated {new_translations} new entries")
+            print(f"Total entries in output: {len(all_translations)}")
             print(f"Saved to: {output_file}")
             
         except Exception as e:
@@ -189,6 +213,9 @@ Examples:
   
   # Translate lines 500-1000
   %(prog)s -i base.json -l Spanish --start-line 500 --end-line 1000
+  
+  # Resume translation, skipping already translated entries
+  %(prog)s -i base.json -l German --skip-existing
         """
     )
     
@@ -200,6 +227,7 @@ Examples:
     parser.add_argument("--batch-size", type=int, default=50, help="Number of entries per batch (default: 50)")
     parser.add_argument("--start-line", type=int, help="Start line number (1-based, default: 1)")
     parser.add_argument("--end-line", type=int, help="End line number (inclusive, default: all)")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip entries that are already translated")
     parser.add_argument("--model", default="gpt-4-turbo-preview", help="OpenAI model to use")
     parser.add_argument("--api-key", help="OpenAI API key (or set OPENAI_API_KEY env var)")
     
@@ -224,7 +252,8 @@ Examples:
             source_language=args.source,
             language_code=args.lang_code,
             start_line=args.start_line,
-            end_line=args.end_line
+            end_line=args.end_line,
+            skip_existing=args.skip_existing
         )
     
     except Exception as e:
