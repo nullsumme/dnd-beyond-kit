@@ -318,12 +318,16 @@ Return ONLY the translations in the same numbered format, nothing else:
                     translations = self.translate_batch(batch, target_language, source_language)
                     all_translations.update(translations)
                     
+                    # Save translations immediately after each successful batch
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        json.dump(all_translations, f, ensure_ascii=False, indent=2)
+                    
                     # Record batch time (excluding the rate limit delay)
                     batch_time = time.time() - batch_start
                     self.batch_times.append(batch_time)
                     
                     # Show completion status for this batch
-                    self.logger.info(f"  ✓ Completed in {batch_time:.1f}s")
+                    self.logger.info(f"  ✓ Completed in {batch_time:.1f}s (saved to {output_file})")
                     
                     # Add a small delay to avoid rate limiting
                     if batch_num < total_batches:
