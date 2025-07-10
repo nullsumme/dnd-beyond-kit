@@ -7,9 +7,11 @@ Specifically designed for translating base.json to language-specific JSON files
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 import re
@@ -17,37 +19,94 @@ import re
 try:
     from openai import OpenAI
 except ImportError:
-    print("Error: OpenAI library not installed. Please run: pip install openai")
+    logging.error("Required libraries not installed. Please run: pip install openai")
     sys.exit(1)
+
+
+# Constants
+DEFAULT_MODEL = "gpt-4-turbo-preview"
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_TEMPERATURE = 0.3
+DEFAULT_MAX_TOKENS = 4000
+RECENT_BATCH_WEIGHT = 0.7
+OLDER_BATCH_WEIGHT = 0.3
+RATE_LIMIT_DELAY = 1
+COST_CONFIRMATION_THRESHOLD = 5.0
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+RETRY_BACKOFF_MULTIPLIER = 2
+
+# D&D-specific system prompt
+SYSTEM_PROMPT = """You are a professional translator specializing in Dungeons & Dragons content. 
+When translating:
+- Maintain consistency with official D&D terminology in the target language
+- Preserve game mechanics terms (AC, HP, DC, etc.) when they're commonly used untranslated
+- Keep proper nouns (character names, place names) unless there's an established translation
+- Maintain the fantasy tone and style appropriate for D&D content
+- Consider context: spell names, class features, monster abilities, and rule descriptions may require different approaches
+- Preserve any game notation like dice rolls (e.g., 1d20+5)
+- Be aware of D&D-specific concepts like alignment, spell schools, damage types, and conditions
+- Translate complete sentences naturally, don't translate word-by-word
+"""
+
+
+
+@dataclass
+class TranslationConfig:
+    """Configuration for translation operations"""
+    model: str = DEFAULT_MODEL
+    temperature: float = DEFAULT_TEMPERATURE
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    batch_size: int = DEFAULT_BATCH_SIZE
+    rate_limit_delay: float = RATE_LIMIT_DELAY
+    cost_confirmation_threshold: float = COST_CONFIRMATION_THRESHOLD
+    max_retries: int = MAX_RETRIES
+    retry_delay: float = RETRY_DELAY
+    retry_backoff_multiplier: float = RETRY_BACKOFF_MULTIPLIER
+    
+
+class TranslationError(Exception):
+    """Base exception for translation errors"""
+    pass
+
+
+class APIError(TranslationError):
+    """OpenAI API related errors"""
+    pass
+
+
+class FileProcessingError(TranslationError):
+    """File processing related errors"""
+    pass
+
+
+class ValidationError(TranslationError):
+    """Input validation errors"""
+    pass
 
 
 class DnDTranslator:
     """Handles D&D-specific translations using OpenAI"""
     
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4-turbo-preview"):
+    def __init__(self, config: Optional[TranslationConfig] = None, api_key: Optional[str] = None):
+        self.config = config or TranslationConfig()
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable or pass via --api-key")
         
-        self.client = OpenAI(api_key=self.api_key)
-        self.model = model
+        if not self.api_key:
+            raise ValidationError("OpenAI API key not found. Set OPENAI_API_KEY environment variable or pass via --api-key")
+        
+        try:
+            self.client = OpenAI(api_key=self.api_key)
+        except Exception as e:
+            raise APIError(f"Failed to initialize OpenAI client: {e}")
         
         # Timing tracking for predictions
         self.batch_times = []
         self.start_time = None
         
-        # D&D-specific context
-        self.system_prompt = """You are a professional translator specializing in Dungeons & Dragons content. 
-        When translating:
-        - Maintain consistency with official D&D terminology in the target language
-        - Preserve game mechanics terms (AC, HP, DC, etc.) when they're commonly used untranslated
-        - Keep proper nouns (character names, place names) unless there's an established translation
-        - Maintain the fantasy tone and style appropriate for D&D content
-        - Consider context: spell names, class features, monster abilities, and rule descriptions may require different approaches
-        - Preserve any game notation like dice rolls (e.g., 1d20+5)
-        - Be aware of D&D-specific concepts like alignment, spell schools, damage types, and conditions
-        - Translate complete sentences naturally, don't translate word-by-word
-        """
+        # Initialize logging
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
     
     def predict_remaining_time(self, completed_batches: int, remaining_batches: int) -> str:
         """Predict remaining time based on completed batch times"""
@@ -63,13 +122,10 @@ class DnDTranslator:
             recent_batches = self.batch_times[-3:]
             older_batches = self.batch_times[:-3]
             
-            recent_weight = 0.7
-            older_weight = 0.3
-            
             recent_avg = sum(recent_batches) / len(recent_batches)
             older_avg = sum(older_batches) / len(older_batches) if older_batches else recent_avg
             
-            avg_time = (recent_avg * recent_weight) + (older_avg * older_weight)
+            avg_time = (recent_avg * RECENT_BATCH_WEIGHT) + (older_avg * OLDER_BATCH_WEIGHT)
         
         # Predict remaining time
         estimated_seconds = avg_time * remaining_batches
@@ -95,7 +151,7 @@ class DnDTranslator:
             return f"{elapsed/3600:.1f}h"
     
     def translate_batch(self, texts: List[str], target_language: str, source_language: str = "English") -> Dict[str, str]:
-        """Translate a batch of texts with D&D context"""
+        """Translate a batch of texts with D&D context and retry logic"""
         # Create a mapping of lowercased keys to original texts for translation
         batch_text = "\n".join([f"{i+1}. {text}" for i, text in enumerate(texts)])
         
@@ -104,50 +160,84 @@ Return ONLY the translations in the same numbered format, nothing else:
 
 {batch_text}"""
         
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,  # Lower temperature for more consistent translations
-                max_tokens=4000
-            )
-            
-            # Parse the response
-            translated_text = response.choices[0].message.content.strip()
-            translations = {}
-            
-            # Extract numbered translations
-            lines = translated_text.split('\n')
-            for line in lines:
-                match = re.match(r'^(\d+)\.\s*(.+)$', line.strip())
-                if match:
-                    idx = int(match.group(1)) - 1
-                    if idx < len(texts):
-                        # Create key-value pair with lowercased key
-                        key = texts[idx].lower()
-                        value = match.group(2).strip()
-                        translations[key] = value
-            
-            return translations
-            
-        except Exception as e:
-            raise Exception(f"Translation failed: {str(e)}")
+        last_exception = None
+        
+        for attempt in range(self.config.max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens
+                )
+                
+                # Parse the response
+                translated_text = response.choices[0].message.content.strip()
+                translations = {}
+                
+                # Extract numbered translations
+                lines = translated_text.split('\n')
+                for line in lines:
+                    match = re.match(r'^(\d+)\.\s*(.+)$', line.strip())
+                    if match:
+                        idx = int(match.group(1)) - 1
+                        if idx < len(texts):
+                            # Create key-value pair with lowercased key
+                            key = texts[idx].lower()
+                            value = match.group(2).strip()
+                            translations[key] = value
+                
+                return translations
+                
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"Translation attempt {attempt + 1} failed: {str(e)}")
+                
+                if attempt < self.config.max_retries - 1:
+                    # Wait before retrying with exponential backoff
+                    delay = self.config.retry_delay * (self.config.retry_backoff_multiplier ** attempt)
+                    self.logger.info(f"Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"All {self.config.max_retries} translation attempts failed")
+        
+        # If we get here, all retries failed
+        raise APIError(f"Translation failed after {self.config.max_retries} attempts: {str(last_exception)}")
     
     def translate_json_file(self, input_file: Path, output_file: Path, target_language: str, 
                           batch_size: int = 50, source_language: str = "English", 
                           language_code: str = None, start_line: int = None, end_line: int = None, 
                           skip_existing: bool = False) -> None:
         """Translate a JSON array file in batches"""
+        # Input validation
+        if not input_file.exists():
+            raise ValidationError(f"Input file does not exist: {input_file}")
+        
+        if not target_language.strip():
+            raise ValidationError("Target language cannot be empty")
+        
+        if batch_size <= 0:
+            raise ValidationError("Batch size must be positive")
+        
+        if start_line is not None and start_line <= 0:
+            raise ValidationError("Start line must be positive")
+        
+        if end_line is not None and end_line <= 0:
+            raise ValidationError("End line must be positive")
+        
+        if start_line is not None and end_line is not None and start_line > end_line:
+            raise ValidationError("Start line must be less than or equal to end line")
+        
         try:
             # Read input file
             with open(input_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             if not isinstance(data, list):
-                raise ValueError("Input file must contain a JSON array")
+                raise ValidationError("Input file must contain a JSON array")
             
             # Limit lines if specified
             total_entries = len(data)
@@ -160,14 +250,14 @@ Return ONLY the translations in the same numbered format, nothing else:
             if end_idx > total_entries:
                 end_idx = total_entries
             if start_idx >= end_idx:
-                raise ValueError(f"Invalid range: start_line {start_line} must be less than end_line {end_line}")
+                raise ValidationError(f"Invalid range: start_line {start_line} must be less than end_line {end_line}")
             
             # Slice the data
             if start_line or end_line:
                 data = data[start_idx:end_idx]
-                print(f"Processing lines {start_idx + 1} to {end_idx} ({len(data)} entries)")
+                self.logger.info(f"Processing lines {start_idx + 1} to {end_idx} ({len(data)} entries)")
             
-            print(f"Loaded {len(data)} entries from {input_file}")
+            self.logger.info(f"Loaded {len(data)} entries from {input_file}")
             
             # Generate output filename with -ai suffix if not provided
             if not output_file:
@@ -187,19 +277,19 @@ Return ONLY the translations in the same numbered format, nothing else:
                 try:
                     with open(output_file, 'r', encoding='utf-8') as f:
                         existing_translations = json.load(f)
-                    print(f"Loaded {len(existing_translations)} existing translations from {output_file}")
+                    self.logger.info(f"Loaded {len(existing_translations)} existing translations from {output_file}")
                 except Exception as e:
-                    print(f"Warning: Could not load existing translations: {e}")
+                    self.logger.warning(f"Could not load existing translations: {e}")
             
             # Filter out already translated entries
             if skip_existing and existing_translations:
                 original_count = len(data)
                 data = [entry for entry in data if entry.lower() not in existing_translations]
                 skipped_count = original_count - len(data)
-                print(f"Skipped {skipped_count} already translated entries")
+                self.logger.info(f"Skipped {skipped_count} already translated entries")
                 
                 if len(data) == 0:
-                    print("All entries already translated!")
+                    self.logger.info("All entries already translated!")
                     return
             
             # Process in batches
@@ -208,7 +298,7 @@ Return ONLY the translations in the same numbered format, nothing else:
             
             # Initialize timing
             self.start_time = time.time()
-            print(f"Starting translation of {len(data)} entries in {total_batches} batches...\n")
+            self.logger.info(f"Starting translation of {len(data)} entries in {total_batches} batches...")
             
             for i in range(0, len(data), batch_size):
                 batch = data[i:i + batch_size]
@@ -221,7 +311,7 @@ Return ONLY the translations in the same numbered format, nothing else:
                 # Show progress with time estimates
                 elapsed = self.format_elapsed_time(self.start_time)
                 eta = self.predict_remaining_time(batch_num - 1, remaining_batches + 1)
-                print(f"Batch {batch_num}/{total_batches} ({len(batch)} items) | Elapsed: {elapsed} | ETA: {eta}")
+                self.logger.info(f"Batch {batch_num}/{total_batches} ({len(batch)} items) | Elapsed: {elapsed} | ETA: {eta}")
                 
                 try:
                     translations = self.translate_batch(batch, target_language, source_language)
@@ -232,15 +322,15 @@ Return ONLY the translations in the same numbered format, nothing else:
                     self.batch_times.append(batch_time)
                     
                     # Show completion status for this batch
-                    print(f"  ✓ Completed in {batch_time:.1f}s")
+                    self.logger.info(f"  ✓ Completed in {batch_time:.1f}s")
                     
                     # Add a small delay to avoid rate limiting
                     if batch_num < total_batches:
-                        time.sleep(1)
+                        time.sleep(self.config.rate_limit_delay)
                         
                 except Exception as e:
-                    print(f"  ✗ Error: {e}")
-                    print("  Continuing with next batch...")
+                    self.logger.error(f"  ✗ Error: {e}")
+                    self.logger.info("  Continuing with next batch...")
                     continue
             
             # Save translations
@@ -252,24 +342,25 @@ Return ONLY the translations in the same numbered format, nothing else:
             successful_batches = len(self.batch_times)
             avg_batch_time = sum(self.batch_times) / len(self.batch_times) if self.batch_times else 0
             
-            print(f"\n{'='*50}")
-            print(f"TRANSLATION COMPLETE!")
-            print(f"{'='*50}")
-            print(f"Total time: {self.format_elapsed_time(self.start_time)}")
-            print(f"Successful batches: {successful_batches}/{total_batches}")
-            print(f"Average batch time: {avg_batch_time:.1f}s")
+            self.logger.info(f"\n{'='*50}")
+            self.logger.info(f"TRANSLATION COMPLETE!")
+            self.logger.info(f"{'='*50}")
+            self.logger.info(f"Total time: {self.format_elapsed_time(self.start_time)}")
+            self.logger.info(f"Successful batches: {successful_batches}/{total_batches}")
+            self.logger.info(f"Average batch time: {avg_batch_time:.1f}s")
             new_translations = len(all_translations) - len(existing_translations)
-            print(f"Translated {new_translations} new entries")
-            print(f"Total entries in output: {len(all_translations)}")
-            print(f"Saved to: {output_file}")
+            self.logger.info(f"Translated {new_translations} new entries")
+            self.logger.info(f"Total entries in output: {len(all_translations)}")
+            self.logger.info(f"Saved to: {output_file}")
             
             if successful_batches > 0:
                 entries_per_second = new_translations / total_time
-                print(f"Translation rate: {entries_per_second:.1f} entries/second")
-            print(f"{'='*50}")
+                self.logger.info(f"Translation rate: {entries_per_second:.1f} entries/second")
+            self.logger.info(f"{'='*50}")
             
         except Exception as e:
-            raise Exception(f"Failed to process file: {str(e)}")
+            self.logger.error(f"Failed to process file: {str(e)}")
+            raise FileProcessingError(f"Failed to process file: {str(e)}")
 
 
 def main():
@@ -316,8 +407,11 @@ Examples:
     args = parser.parse_args()
     
     try:
+        # Create configuration
+        config = TranslationConfig(model=args.model)
+        
         # Initialize translator
-        translator = DnDTranslator(api_key=args.api_key, model=args.model)
+        translator = DnDTranslator(config=config, api_key=args.api_key)
         
         # Process the file
         input_path = Path(args.input)
@@ -339,7 +433,7 @@ Examples:
         )
     
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        logging.error(f"Error: {e}")
         sys.exit(1)
 
 
