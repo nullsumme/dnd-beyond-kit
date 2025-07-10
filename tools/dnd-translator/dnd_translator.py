@@ -211,7 +211,7 @@ Return ONLY the translations in the same numbered format, nothing else:
                           batch_size: int = 50, source_language: str = "English", 
                           language_code: str = None, start_line: int = None, end_line: int = None, 
                           skip_existing: bool = False) -> None:
-        """Translate a JSON array file in batches"""
+        """Translate a JSON array file in batches with incremental saving after each batch"""
         # Input validation
         if not input_file.exists():
             raise ValidationError(f"Input file does not exist: {input_file}")
@@ -299,6 +299,7 @@ Return ONLY the translations in the same numbered format, nothing else:
             # Initialize timing
             self.start_time = time.time()
             self.logger.info(f"Starting translation of {len(data)} entries in {total_batches} batches...")
+            self.logger.info(f"Progress will be saved after each batch to: {output_file}")
             
             for i in range(0, len(data), batch_size):
                 batch = data[i:i + batch_size]
