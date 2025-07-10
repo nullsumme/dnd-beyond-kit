@@ -32,6 +32,10 @@ class DnDTranslator:
         self.client = OpenAI(api_key=self.api_key)
         self.model = model
         
+        # Timing tracking for predictions
+        self.batch_times = []
+        self.start_time = None
+        
         # D&D-specific context
         self.system_prompt = """You are a professional translator specializing in Dungeons & Dragons content. 
         When translating:
@@ -44,6 +48,51 @@ class DnDTranslator:
         - Be aware of D&D-specific concepts like alignment, spell schools, damage types, and conditions
         - Translate complete sentences naturally, don't translate word-by-word
         """
+    
+    def predict_remaining_time(self, completed_batches: int, remaining_batches: int) -> str:
+        """Predict remaining time based on completed batch times"""
+        if len(self.batch_times) == 0:
+            return "Calculating..."
+        
+        # Use adaptive average - more weight to recent batches
+        if len(self.batch_times) <= 3:
+            # Use simple average for first few batches
+            avg_time = sum(self.batch_times) / len(self.batch_times)
+        else:
+            # Weighted average favoring recent batches
+            recent_batches = self.batch_times[-3:]
+            older_batches = self.batch_times[:-3]
+            
+            recent_weight = 0.7
+            older_weight = 0.3
+            
+            recent_avg = sum(recent_batches) / len(recent_batches)
+            older_avg = sum(older_batches) / len(older_batches) if older_batches else recent_avg
+            
+            avg_time = (recent_avg * recent_weight) + (older_avg * older_weight)
+        
+        # Predict remaining time
+        estimated_seconds = avg_time * remaining_batches
+        
+        # Format time duration
+        if estimated_seconds < 60:
+            return f"{estimated_seconds:.0f}s"
+        elif estimated_seconds < 3600:
+            minutes = estimated_seconds / 60
+            return f"{minutes:.1f}m"
+        else:
+            hours = estimated_seconds / 3600
+            return f"{hours:.1f}h"
+    
+    def format_elapsed_time(self, start_time: float) -> str:
+        """Format elapsed time since start"""
+        elapsed = time.time() - start_time
+        if elapsed < 60:
+            return f"{elapsed:.0f}s"
+        elif elapsed < 3600:
+            return f"{elapsed/60:.1f}m"
+        else:
+            return f"{elapsed/3600:.1f}h"
     
     def translate_batch(self, texts: List[str], target_language: str, source_language: str = "English") -> Dict[str, str]:
         """Translate a batch of texts with D&D context"""
@@ -157,34 +206,67 @@ Return ONLY the translations in the same numbered format, nothing else:
             all_translations = existing_translations.copy()  # Start with existing translations
             total_batches = (len(data) + batch_size - 1) // batch_size
             
+            # Initialize timing
+            self.start_time = time.time()
+            print(f"Starting translation of {len(data)} entries in {total_batches} batches...\n")
+            
             for i in range(0, len(data), batch_size):
                 batch = data[i:i + batch_size]
                 batch_num = (i // batch_size) + 1
+                remaining_batches = total_batches - batch_num
                 
-                print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} items)...")
+                # Start timing this batch
+                batch_start = time.time()
+                
+                # Show progress with time estimates
+                elapsed = self.format_elapsed_time(self.start_time)
+                eta = self.predict_remaining_time(batch_num - 1, remaining_batches + 1)
+                print(f"Batch {batch_num}/{total_batches} ({len(batch)} items) | Elapsed: {elapsed} | ETA: {eta}")
                 
                 try:
                     translations = self.translate_batch(batch, target_language, source_language)
                     all_translations.update(translations)
+                    
+                    # Record batch time (excluding the rate limit delay)
+                    batch_time = time.time() - batch_start
+                    self.batch_times.append(batch_time)
+                    
+                    # Show completion status for this batch
+                    print(f"  ✓ Completed in {batch_time:.1f}s")
                     
                     # Add a small delay to avoid rate limiting
                     if batch_num < total_batches:
                         time.sleep(1)
                         
                 except Exception as e:
-                    print(f"Error in batch {batch_num}: {e}")
-                    print("Continuing with next batch...")
+                    print(f"  ✗ Error: {e}")
+                    print("  Continuing with next batch...")
                     continue
             
             # Save translations
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(all_translations, f, ensure_ascii=False, indent=2)
             
-            print(f"\nTranslation complete!")
+            # Final timing summary
+            total_time = time.time() - self.start_time
+            successful_batches = len(self.batch_times)
+            avg_batch_time = sum(self.batch_times) / len(self.batch_times) if self.batch_times else 0
+            
+            print(f"\n{'='*50}")
+            print(f"TRANSLATION COMPLETE!")
+            print(f"{'='*50}")
+            print(f"Total time: {self.format_elapsed_time(self.start_time)}")
+            print(f"Successful batches: {successful_batches}/{total_batches}")
+            print(f"Average batch time: {avg_batch_time:.1f}s")
             new_translations = len(all_translations) - len(existing_translations)
             print(f"Translated {new_translations} new entries")
             print(f"Total entries in output: {len(all_translations)}")
             print(f"Saved to: {output_file}")
+            
+            if successful_batches > 0:
+                entries_per_second = new_translations / total_time
+                print(f"Translation rate: {entries_per_second:.1f} entries/second")
+            print(f"{'='*50}")
             
         except Exception as e:
             raise Exception(f"Failed to process file: {str(e)}")

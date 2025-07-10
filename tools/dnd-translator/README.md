@@ -8,6 +8,7 @@ A Python CLI tool for translating D&D-related content using OpenAI models. Speci
 - **Batch Processing**: Handles large translation files efficiently
 - **Rate Limiting**: Built-in delays to avoid API rate limits
 - **Progress Tracking**: Shows translation progress with batch information
+- **Dynamic Time Prediction**: Estimates completion time based on actual batch performance
 - **Error Handling**: Continues processing even if individual batches fail
 - **Flexible Output**: Configurable output filenames and language codes
 
